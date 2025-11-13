@@ -1,0 +1,46 @@
+{
+  "targets": {
+    "法人名": {
+      "sheet": "高圧",
+      "cell": "B1",
+
+      "regex_patterns": [
+        "(.+?)\\s*様",
+        "(.+?)\\s*御中",
+        "(?:ご契約者名|契約者名|契約名義)[:：\\s]*([^\\r\\n]+)"
+      ],
+
+    
+      "corp_end_markers": ["病院", "医院", "クリニック", "会社"],
+
+      "postprocess": { "strip": true, "trim_chars": " 　\t" },
+
+      
+      "geom_hints": { "anchor_texts": ["様"], "x_tolerance": 40, "y_up_range": 60 }
+    },
+
+    "契約電力": {
+      "sheet": "高圧",
+      "cell": "G12",
+
+      "table": {
+        "row_label_keywords": ["主契約", "主 契約"],
+        "neighbor_col_offset": 1,
+        "header_kw_for_kw_col": ["kW", "ＫＷ", "kW／kWh", "kW/kWh", "kW ／ kWh", "kw"],
+        "fallback_col_offset_from_label": 2,
+
+        "basic_row_keywords": ["基本料金", "基本料金（力率100%）", "基本料金(力率100%)", "基本 料金"],
+        "kw_header_keywords": ["kW", "ＫＷ", "kW／kWh", "kW/kWh", "kW ／ kWh", "kw"]
+      },
+
+      "regex_patterns": [
+        "主契約\\s*[:：]?[\\s　]*([0-9,]+\\.?[0-9]*)\\s*(?:kW|ＫＷ|kw)?",
+        "(?:契約電力|ご契約電力)[:：\\s]*([0-9,]+\\.?[0-9]*)\\s*(?:kW|ＫＷ|kw)"
+      ],
+
+     
+      "postprocess": { "strip": true }
+    }
+  }
+}
+

@@ -1,0 +1,22 @@
+@"
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE/OS
+.vscode/
+.idea/
+.DS_Store
+
+# Logs
+*.log
+
+# Excel: 生成物は除外、テンプレは許可
+*.xlsx
+!template_output.xlsx
+# Excelの一時ファイルも除外
+~$*.xlsx
+"@ | Out-File -Encoding utf8 .gitignore
