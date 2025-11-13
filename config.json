@@ -1,0 +1,54 @@
+﻿{
+  "ocr": {
+    "lang": "jpn+eng",
+    "dpi": 300,
+    "psm": 6,
+    "oem": 3,
+    "tesseract_cmd": null,
+    "poppler_path": null
+  },
+  "default_targets": {
+    "法人名": {
+      "sheet": "高圧",
+      "cell": "B1",
+      "regex_patterns": [
+        "(.+?)\\s*様",
+        "(.+?)\\s*御中",
+        "(?:ご契約者名|契約者名|契約名義)[:：\\s]*([^\\r\\n]+)"
+      ],
+      "postprocess": { "strip": true, "trim_chars": " 　\\t" },
+      "geom_hints": { "anchor_texts": ["様"], "x_tolerance": 40, "y_up_range": 60 }
+    },
+    "契約電力": {
+      "sheet": "高圧",
+      "cell": "G12",
+      "table": {
+        "row_label_keywords": ["基本料金", "基本料金（力率100%）", "基本料金(力率100%)"],
+        "header_kw_for_kw_col": ["kW", "ＫＷ", "kw", "kW／kWh", "kW/kWh", "kW ／ kWh"],
+        "fallback_col_offset_from_label": 2
+      },
+      "regex_patterns": [
+        "(?:契約電力|ご契約電力)[:：\\s]*([0-9,]+\\.?[0-9]*)\\s*(?:kW|ＫＷ|kw)"
+      ],
+      "postprocess": { "strip": true, "to_number": true }
+    }
+  },
+  "forms": [
+    {
+      "id": "A電力_請求書",
+      "detect": { "all_of": ["ご請求書", "A電力"], "any_of": ["契約電力", "基本料金"], "none_of": ["B電力"] },
+      "targets": {
+        "法人名": { "cell": "B2" },
+        "契約電力": { "cell": "H15" }
+      }
+    },
+    {
+      "id": "B電力_検針票",
+      "detect": { "all_of": ["検針票", "B電力"], "any_of": ["ご契約電力"], "none_of": [] },
+      "targets": {
+        "法人名": { "cell": "C3" },
+        "契約電力": { "cell": "F10" }
+      }
+    }
+  ]
+}
