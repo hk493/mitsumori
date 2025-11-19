@@ -7,6 +7,7 @@ import pdfplumber
 from openpyxl import load_workbook, Workbook
 from pdf2image import convert_from_bytes
 from rapidocr_onnxruntime import RapidOCR
+import pytesseract
 
 _RAPID_OCR = RapidOCR()
 
@@ -70,6 +71,118 @@ def _is_text_pdf(pdf_bytes: bytes) -> Tuple[bool, str]:
 
 
 # ============ OCR（RapidOCR + 前処理 + 領域再OCR） ============
+def _deskew_image(arr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100,
+                            minLineLength=max(arr.shape[1] // 10, 40),
+                            maxLineGap=20)
+    if lines is None or len(lines) == 0:
+        return arr
+    angles = []
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if -45 <= angle <= 45:
+            angles.append(angle)
+    if not angles:
+        return arr
+    median_angle = np.median(angles)
+    h, w = arr.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+    return cv2.warpAffine(arr, M, (w, h), flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REPLICATE)
+
+
+def _remove_lines(arr: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY_INV, 21, 10)
+    horizontal_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (max(10, arr.shape[1] // 30), 1))
+    vertical_kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (1, max(10, arr.shape[0] // 30)))
+    horizontal = cv2.morphologyEx(bw, cv2.MORPH_OPEN, horizontal_kernel)
+    vertical = cv2.morphologyEx(bw, cv2.MORPH_OPEN, vertical_kernel)
+    mask = cv2.bitwise_or(horizontal, vertical)
+    mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=1)
+    if not np.any(mask):
+        return arr
+    return cv2.inpaint(arr, mask, 3, cv2.INPAINT_TELEA)
+
+
+def _pytesseract_word_data(img: np.ndarray, psm: int) -> List[dict]:
+    data = pytesseract.image_to_data(
+        img,
+        lang="jpn+eng",
+        config=f"--psm {psm}",
+        output_type=pytesseract.Output.DICT,
+    )
+    words = []
+    n = len(data.get("text", []))
+    for i in range(n):
+        if data.get("level", [])[i] != 5:
+            continue
+        text = (data.get("text", [""])[i] or "").strip()
+        if not text:
+            continue
+        try:
+            conf = float(data.get("conf", ["-1"])[i])
+        except ValueError:
+            conf = -1.0
+        words.append({
+            "text": text,
+            "conf": conf,
+            "bbox": (
+                data.get("left", [0])[i],
+                data.get("top", [0])[i],
+                data.get("width", [0])[i],
+                data.get("height", [0])[i],
+            ),
+        })
+    return words
+
+
+def _run_variant_ocr(img: np.ndarray) -> Tuple[List[dict], float]:
+    base_words = _pytesseract_word_data(img, psm=6)
+    if not base_words:
+        fallback_words = _pytesseract_word_data(img, psm=7)
+        mean_conf = np.mean([w["conf"] for w in fallback_words if w["conf"] >= 0]) if fallback_words else 0.0
+        return fallback_words, float(mean_conf)
+    needs_fallback = any(w["conf"] < 40 for w in base_words)
+    fallback_words = _pytesseract_word_data(img, psm=7) if needs_fallback else []
+    if fallback_words:
+        limit = min(len(base_words), len(fallback_words))
+        for i in range(limit):
+            if base_words[i]["conf"] < 40 <= fallback_words[i]["conf"]:
+                base_words[i] = fallback_words[i]
+    mean_conf = np.mean([w["conf"] for w in base_words if w["conf"] >= 0]) if base_words else 0.0
+    return base_words, float(mean_conf)
+
+
+def _fuse_variant_words(variant_words: List[Tuple[str, List[dict], float]]) -> str:
+    if not variant_words:
+        return ""
+    max_len = max((len(words) for _, words, _ in variant_words), default=0)
+    fused_tokens: List[str] = []
+    for idx in range(max_len):
+        candidates = []
+        for name, words, _ in variant_words:
+            if idx < len(words):
+                candidates.append((name, words[idx]))
+        if not candidates:
+            continue
+        candidates.sort(key=lambda c: c[1]["conf"])
+        best_name, best_word = candidates[-1]
+        if best_word["conf"] < 40:
+            better = next((c for c in reversed(candidates) if c[1]["conf"] >= 40), None)
+            if better:
+                best_name, best_word = better
+        fused_tokens.append(best_word["text"])
+    return " ".join(fused_tokens).strip()
+
+
 def _ocr_text_and_words(pdf_bytes: bytes, cfg: dict) -> Tuple[str, List[dict]]:
     dpi = int(cfg.get("ocr_dpi", 420))
     pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=3,
@@ -81,12 +194,49 @@ def _ocr_text_and_words(pdf_bytes: bytes, cfg: dict) -> Tuple[str, List[dict]]:
     for img in pages:
         arr = np.array(img)
         if preprocess:
+            arr = _deskew_image(arr)
+            arr = _remove_lines(arr)
             gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-            gray = cv2.bilateralFilter(gray, 9, 75, 75)
-            thr = cv2.adaptiveThreshold(gray,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY,41,9)
-            arr = cv2.cvtColor(thr, cv2.COLOR_GRAY2RGB)
-        result, _ = _RAPID_OCR(arr)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            clahe_img = clahe.apply(gray)
+            blur = cv2.GaussianBlur(clahe_img, (0, 0), 1.0)
+            unsharp = cv2.addWeighted(clahe_img, 1.5, blur, -0.5, 0)
+            _, variant_a = cv2.threshold(unsharp, 0, 255,
+                                         cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            if hasattr(cv2, "ximgproc") and hasattr(cv2.ximgproc, "niBlackThreshold"):
+                variant_b = cv2.ximgproc.niBlackThreshold(
+                    gray, 255, cv2.THRESH_BINARY, 41, -0.2,
+                    cv2.ximgproc.BINARIZATION_SAUVOLA,
+                )
+            else:
+                variant_b = cv2.adaptiveThreshold(
+                    gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                    cv2.THRESH_BINARY, 41, 5,
+                )
+            smooth = cv2.bilateralFilter(gray, 9, 75, 75)
+            variant_c = cv2.adaptiveThreshold(
+                smooth, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 41, 9,
+            )
+            variant_images = [
+                ("clahe_otsu", variant_a),
+                ("sauvola", variant_b),
+                ("bilateral_adaptive", variant_c),
+            ]
+        else:
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            variant_images = [("raw", gray)]
+
+        variant_words: List[Tuple[str, List[dict], float]] = []
+        for name, variant in variant_images:
+            words, mean_conf = _run_variant_ocr(variant)
+            variant_words.append((name, words, mean_conf))
+        fused_text = _fuse_variant_words(variant_words)
+        if fused_text:
+            all_texts.append(fused_text)
+
+        arr_for_rapid = arr if preprocess else cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        result, _ = _RAPID_OCR(arr_for_rapid)
         if not result: continue
         text = " ".join([r[1] for r in result])
         all_texts.append(text)
