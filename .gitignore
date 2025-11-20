@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Streamlit cache
+.streamlit/
+logs/
+output/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.tmp
+*.log
+*.bak
+
+# ExcelやPDFの一時出力
+*.xlsx~
+*.pdf
+*.xlsm~
+*.xls~
