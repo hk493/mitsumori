@@ -1,343 +1,167 @@
 from __future__ import annotations
 import io, re, json, tempfile
 from pathlib import Path
-from typing import Dict, Tuple, Optional, List
-
-import numpy as np
-import pandas as pd
-import pdfplumber
-import cv2
+from typing import Dict, Tuple
 from pdf2image import convert_from_bytes
-from openpyxl import load_workbook
 from paddleocr import PaddleOCR
+import numpy as np
+import cv2
+import pandas as pd
+from openpyxl import load_workbook
 
-
-# ==============================
-# 設定ロード
-# ==============================
 def load_config(path: str = "config.json") -> dict:
-    p = Path(path)
-    if not p.exists():
-        # 最低限のデフォルト
-        return {
-            "poppler_path": None,
-            "ocr": {"dpi": 400},
-            "paddle": {"lang": "japan", "use_angle_cls": True},
-            "excel_cell_map": {"sheet": "高圧", "法人名": "B1", "契約電力": "G12"},
-            "stop_keywords": ["会社", "株式会社", "有限会社", "病院", "医院", "クリニック"],
-            "targets": {"法人名": {"regex": []}, "契約電力": {"regex": []}},
-            "excel_input": {"sheet_candidates": ["高圧", "Sheet1"]}
-        }
-    with p.open("r", encoding="utf-8") as f:
+    import json
+    with open(path, encoding="utf-8") as f:
         return json.load(f)
 
-
-# ==============================
-# OCR 初期化
-# ==============================
 _OCR = None
-def _get_ocr(lang: str = "japan", use_angle_cls: bool = True) -> PaddleOCR:
+def _get_ocr(lang: str = "japan", use_angle_cls: bool = True, 
+             det_db_thresh: float = 0.2, det_db_box_thresh: float = 0.3,
+             rec_batch_num: int = 6) -> PaddleOCR:
+    """
+    PaddleOCR初期化（シングルトンパターン・高精度設定）
+    
+    Args:
+        lang: OCR言語 (japan=日本語, en=英語, ch=中国語など)
+        use_angle_cls: 文字の回転検出を有効化 (True=回転文字も認識/精度UP, False=高速)
+        det_db_thresh: テキスト検出閾値（低いほど小さい文字も検出、0.2=最高感度）
+        det_db_box_thresh: ボックス信頼度閾値（低いほど広範囲検出、0.3=広範囲）
+        rec_batch_num: 認識バッチサイズ（小さいほど精度UP、6=精度重視）
+    
+    Returns:
+        PaddleOCRインスタンス
+    
+    ※精度最大化設定:
+    - use_angle_cls=True: 回転文字認識
+    - det_db_thresh=0.2: 最高検出感度
+    - det_db_box_thresh=0.3: 広範囲検出
+    - rec_batch_num=6: 精度重視バッチ
+    - use_space_char=True: スペース文字認識
+    - drop_score=0.3: 低信頼度文字も採用
+    """
     global _OCR
     if _OCR is None:
-        _OCR = PaddleOCR(lang=lang, use_angle_cls=use_angle_cls, show_log=False)
+        _OCR = PaddleOCR(
+            lang=lang,
+            use_angle_cls=use_angle_cls,
+            det_db_thresh=det_db_thresh,
+            det_db_box_thresh=det_db_box_thresh,
+            rec_batch_num=rec_batch_num,
+            use_space_char=True,
+            drop_score=0.3,
+            show_log=False
+        )
     return _OCR
 
+def process_pdf_bytes(pdf_bytes: bytes, cfg: dict) -> Tuple[Dict, str]:
+    """
+    PDFファイルからOCRでテキストを抽出し、指定フィールドを取得
+    
+    Args:
+        pdf_bytes: PDFファイルのバイナリデータ
+        cfg: config.jsonの設定辞書
+    
+    Returns:
+        (抽出フィールド辞書, 全テキスト)
+    
+    ※OCR精度向上のための設定 (config.json):
+    - ocr.dpi: 200→300-400 (解像度UP=精度UP、処理時間増)
+    - performance.max_width: 1000→1200-1500 (画像幅UP=精度UP、メモリ消費増)
+    - paddle.use_angle_cls: false→true (回転文字認識=精度UP)
+    - performance.max_pages_per_pdf: 処理するページ数制限 (0=全ページ)
+    """
+    # config.jsonから設定を取得（バランス型高精度設定）
+    dpi = cfg.get("ocr", {}).get("dpi", 300)  # OCR解像度（300=高精度バランス型）
+    max_pages = cfg.get("performance", {}).get("max_pages_per_pdf", 3)  # 処理ページ数制限（3ページ）
+    max_width = cfg.get("performance", {}).get("max_width", 1500)  # 画像最大幅（1500=高精度）
+    use_angle_cls = cfg.get("paddle", {}).get("use_angle_cls", True)  # 回転検出（精度UP）
+    lang = cfg.get("paddle", {}).get("lang", "japan")  # OCR言語
+    det_db_thresh = cfg.get("paddle", {}).get("det_db_thresh", 0.3)  # 検出閾値（バランス型）
+    det_db_box_thresh = cfg.get("paddle", {}).get("det_db_box_thresh", 0.5)  # ボックス閾値（標準）
+    rec_batch_num = cfg.get("paddle", {}).get("rec_batch_num", 10)  # バッチサイズ（バランス）
 
-# ==============================
-# ユーティリティ
-# ==============================
-def _truncate_corporate_name(name: str, stop_words: List[str]) -> str:
-    """法人名は『様』より左、かつ「会社/病院/クリニック」等で打ち切り。数字は除外。"""
-    s = str(name).strip()
-    # 数字が含まれる場合は住所等の可能性が高いので削る
-    s = re.sub(r"[0-9０-９\-－ー–—‐―/\.]{3,}.*$", "", s)
-
-    # 「様」より左を優先
-    if "様" in s:
-        s = s.split("様")[0]
-
-    # 会社名の終端で打ち切り
-    tails = ["株式会社", "有限会社", "医療法人", "学校法人", "合同会社", "合名会社", "合資会社", "病院", "医院", "クリニック", "会社"]
-    for t in sorted(tails, key=len, reverse=True):
-        if t in s:
-            s = s[: s.find(t) + len(t)]
+    images = convert_from_bytes(pdf_bytes, dpi=dpi)
+    texts = []
+    fields = {}
+    for i, img in enumerate(images):
+        if i >= max_pages:
             break
+        # 画像をNumPy配列に変換
+        img_np = np.array(img)
+        h, w = img_np.shape[:2]
+        
+        # 画像幅を制限してメモリ消費を抑制（精度とのバランス）
+        if w > max_width:
+            scale = max_width / w
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            img_np = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # グレースケール変換
+        if len(img_np.shape) == 3:
+            gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = img_np.copy()
+        
+        # シンプル高精度前処理: 最小限の処理で最大の精度
+        # ガウシアンブラーでノイズ除去（バイラテラルより安定）
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        
+        # 2値化なし: PaddleOCRはグレースケールのままの方が精度が高い
+        img_np = gray
+        
+        # OCR実行（バランス型パラメータ）
+        ocr = _get_ocr(lang, use_angle_cls, det_db_thresh, det_db_box_thresh, rec_batch_num)
+        res = ocr.ocr(img_np, cls=use_angle_cls)
+        page_text = "\n".join([t[1][0] for line in res for t in (line if isinstance(line, list) else [line])])
+        texts.append(page_text)
+        # 簡易フィールド抽出例（法人名・契約電力）
+        for k in cfg.get("targets", {}):
+            for kw in cfg.get("excel_input", {}).get("label_keywords", {}).get(k, []):
+                match = re.search(rf"{kw}[:：]?\s*([^\s\n]+)", page_text)
+                if match:
+                    fields[k] = match.group(1)
+    return fields, "\n\n".join(texts)
 
-    s = re.sub(r"[　 ]{2,}", " ", s)
-    return s.strip()
+def process_excel_bytes(excel_bytes: bytes, cfg: dict) -> Tuple[Dict, pd.DataFrame]:
+    from io import BytesIO
+    excel_io = BytesIO(excel_bytes)
+    wb = load_workbook(excel_io, data_only=True)
+    sheet_name = cfg.get("excel_cell_map", {}).get("sheet", wb.sheetnames[0])
+    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
+    data = ws.values
+    cols = next(data)
+    df = pd.DataFrame(data, columns=cols)
+    fields = {}
+    # 簡易フィールド抽出例（法人名・契約電力）
+    for k in cfg.get("targets", {}):
+        for kw in cfg.get("excel_input", {}).get("label_keywords", {}).get(k, []):
+            for col in df.columns:
+                if kw in str(col):
+                    fields[k] = df[col].iloc[0]
+    return fields, df
 
-
-def _num_to_clean_str(v) -> str:
-    if v is None:
-        return ""
-    s = str(v).strip()
-    s2 = s.replace(",", "")
-    try:
-        f = float(s2)
-        if abs(f - round(f)) < 1e-9:
-            return str(int(round(f)))
-        return re.sub(r"0+$", "", f"{f}")
-    except Exception:
-        return s
-
-
-# ==============================
-# 前処理（標準）
-# ==============================
-def _deskew(gray):
-    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    coords = np.column_stack(np.where(thr == 0))
-    if len(coords) < 100:
-        return gray
-    angle = cv2.minAreaRect(coords)[-1]
-    angle = -(90 + angle) if angle < -45 else -angle
-    h, w = gray.shape
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
-def _preprocess_page(img):
-    # RGB np.array -> 前処理（軽め）
-    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 5, 50, 50)
-    gray = cv2.convertScaleAbs(gray, alpha=1.3, beta=10)
-    gray = _deskew(gray)
-    bin_img = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 55, 7)
-    return bin_img
-
-
-# ==============================
-# PDF：全ページOCR → テキスト連結
-# ==============================
-def _ocr_all_pages(pdf_bytes: bytes, cfg: dict) -> str:
-    dpi = cfg.get("ocr", {}).get("dpi", 400)
-    poppler = cfg.get("poppler_path")
-    lang = cfg.get("paddle", {}).get("lang", "japan")
-    use_angle_cls = cfg.get("paddle", {}).get("use_angle_cls", True)
-
-    ocr = _get_ocr(lang=lang, use_angle_cls=use_angle_cls)
-    pages = convert_from_bytes(pdf_bytes, dpi=dpi, poppler_path=poppler)
-    texts: List[str] = []
-
-    for idx, img in enumerate(pages, 1):
-        arr = np.array(img)
-        proc = _preprocess_page(arr)
-        try:
-            result = ocr.ocr(proc, cls=True)
-        except Exception as e:
-            print(f"OCR失敗({idx}): {e}")
-            continue
-        if not result or not isinstance(result, list) or not result[0]:
-            continue
-
-        page_texts: List[str] = []
-        for line in result[0]:
-            try:
-                txt = line[1][0]
-                if txt:
-                    page_texts.append(txt)
-            except Exception:
-                continue
-        texts.append("\n".join(page_texts))
-
-    return "\n\n--- PAGE SPLIT ---\n\n".join(texts)
-
-
-# ==============================
-# PDF：抽出（法人名／契約電力）
-# ==============================
-def _extract_fields_from_text(text: str, cfg: dict) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-
-    # 法人名
-    corp = None
-    for pat in cfg.get("targets", {}).get("法人名", {}).get("regex", []):
-        m = re.search(pat, text, flags=re.MULTILINE)
-        if m:
-            grp = m.group(1) if m.groups() else m.group(0)
-            corp = grp.strip()
-            break
-    if corp:
-        corp = _truncate_corporate_name(corp, cfg.get("stop_keywords", []))
-        if corp:
-            out["法人名"] = corp
-
-    # 契約電力（kWhを誤検出しないように(?!h)）
-    kw = None
-    for pat in cfg.get("targets", {}).get("契約電力", {}).get("regex", []):
-        m = re.search(pat, text, flags=re.MULTILINE | re.IGNORECASE)
-        if m:
-            # ラベル＋数値 or 数値のみ（第2グループ優先）
-            if m.lastindex and m.lastindex >= 2 and m.group(2):
-                kw = m.group(2)
-            else:
-                kw = m.group(1)
-            kw = _num_to_clean_str(kw)
-            break
-    if kw:
-        out["契約電力"] = kw
-
-    return out
-
-
-def process_pdf_bytes(pdf_bytes: bytes, cfg: dict) -> Tuple[Dict[str, str], str]:
-    """常に全ページOCR → テキスト → 抽出dict を返す"""
-    text = _ocr_all_pages(pdf_bytes, cfg) or ""
-    fields = _extract_fields_from_text(text, cfg)
-    return fields, text
-
-
-# ==============================
-# Excel：お客さま名の隣／最新月の契約電力
-# ==============================
-def _read_excel_to_df(xls_bytes: bytes, sheet_candidates: List[str]) -> pd.DataFrame:
-    bio = io.BytesIO(xls_bytes)
-    try:
-        xl = pd.ExcelFile(bio)
-        sheet = next((s for s in sheet_candidates if s in xl.sheet_names), xl.sheet_names[0])
-        return xl.parse(sheet, header=None)
-    except Exception:
-        from openpyxl import load_workbook
-        wb = load_workbook(io.BytesIO(xls_bytes), data_only=True)
-        ws = wb[wb.sheetnames[0]]
-        data = [[c for c in row] for row in ws.iter_rows(values_only=True)]
-        return pd.DataFrame(data)
-
-
-def process_excel_bytes(xls_bytes: bytes, cfg: dict):
-    excel_cfg = cfg.get("excel_input", {})
-    sheet_candidates = excel_cfg.get("sheet_candidates", ["高圧", "Sheet1"])
-    stop_words = cfg.get("stop_keywords", [])
-
-    df = _read_excel_to_df(xls_bytes, sheet_candidates)
-    H, W = df.shape
-    result: Dict[str, str] = {}
-
-    # 1) 「お客さま名」右隣（なければ下のセル）
-    corp_raw = None
-    for r in range(min(H, 80)):
-        for c in range(min(W, 80)):
-            v = df.iat[r, c]
-            if v is None:
-                continue
-            s = str(v)
-            if ("お客さま名" in s) or ("お客様名" in s) or ("会社名" in s) or ("法人名" in s):
-                cand = None
-                if c + 1 < W and df.iat[r, c + 1] not in (None, ""):
-                    cand = df.iat[r, c + 1]
-                elif r + 1 < H and df.iat[r + 1, c] not in (None, ""):
-                    cand = df.iat[r + 1, c]
-                if cand not in (None, ""):
-                    corp_raw = str(cand).strip()
-                break
-        if corp_raw:
-            break
-    if corp_raw:
-        corp = _truncate_corporate_name(corp_raw, stop_words)
-        if corp:
-            result["法人名"] = corp
-
-    # 2) 契約電力(kW)列 & 月列
-    power_col = None
-    header_row = None
-    for r in range(min(H, 50)):
-        for c in range(W):
-            val = df.iat[r, c]
-            if val is None:
-                continue
-            s = str(val)
-            if ("契約電力" in s) and (("kW" in s) or ("kw" in s) or ("ＫＷ" in s) or ("ｋＷ" in s) or ("kＷ" in s)):
-                power_col, header_row = c, r
-                break
-        if power_col is not None:
-            break
-
-    # 月列の推測
-    month_col = None
-    if header_row is not None:
-        # 明示的ヘッダ
-        for c in range(W):
-            val = df.iat[header_row, c]
-            if val is None:
-                continue
-            s = str(val)
-            if ("月分" in s) or (s.strip() in ("月", "年月")):
-                month_col = c
-                break
-
-        # パターンから最多一致の列を選ぶ
-        if month_col is None:
-            def count_month_like(ci: int) -> int:
-                cnt = 0
-                for r in range(header_row + 1, min(H, header_row + 60)):
-                    v = df.iat[r, ci]
-                    if v is None:
-                        continue
-                    if re.search(r"20\d{2}年\s*\d{1,2}月", str(v)):
-                        cnt += 1
-                return cnt
-
-            best_cnt, best_c = 0, None
-            for c in range(min(W, 15)):
-                cnt = count_month_like(c)
-                if cnt > best_cnt:
-                    best_cnt, best_c = cnt, c
-            if best_c is not None and best_cnt > 0:
-                month_col = best_c
-
-    def parse_month(s: str) -> Optional[Tuple[int, int]]:
-        m = re.search(r"(20\d{2})\s*年\s*(\d{1,2})\s*月", s)
-        if not m:
-            return None
-        return int(m.group(1)), int(m.group(2))
-
-    latest_power = None
-    if power_col is not None and header_row is not None and month_col is not None:
-        latest_key = (-1, -1)
-        for r in range(header_row + 1, H):
-            mv = df.iat[r, month_col]
-            if mv is None:
-                continue
-            ym = parse_month(str(mv))
-            if ym is None:
-                continue
-            pv = df.iat[r, power_col] if power_col < W else None
-            if pv in (None, ""):
-                continue
-            if ym > latest_key:
-                latest_key = ym
-                latest_power = _num_to_clean_str(pv)
-
-    if latest_power:
-        result["契約電力"] = latest_power
-
-    return result, df
-
-
-# ==============================
-# 既存テンプレへ書き込み（必須）
-# ==============================
-def write_to_excel(fields: Dict[str, str], cfg: dict, template_name: str = "template_output.xlsx") -> str:
-    cell_map = cfg.get("excel_cell_map", {"sheet": "高圧", "法人名": "B1", "契約電力": "G12"})
-    sheet = cell_map.get("sheet", "高圧")
-
-    template_path = Path(template_name)
+def write_to_excel(list_of_fields: list, cfg: dict) -> str:
+    from openpyxl import load_workbook
+    template_path = Path("template_output.xlsx")
     if not template_path.exists():
-        # 既存テンプレが必須
-        raise FileNotFoundError("template_output.xlsx が見つかりません。プロジェクト直下に置いてから再実行してください。")
-
+        return ""
     wb = load_workbook(template_path)
-    if sheet not in wb.sheetnames:
-        wb.create_sheet(title=sheet)
-    ws = wb[sheet]
+    sheet_name = cfg.get("excel_cell_map", {}).get("sheet", wb.sheetnames[0])
+    ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
 
-    if "法人名" in fields:
-        ws[cell_map.get("法人名", "B1")] = fields["法人名"]
-    if "契約電力" in fields:
-        ws[cell_map.get("契約電力", "G12")] = fields["契約電力"]
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-    wb.save(tmp.name)
-    tmp_path = tmp.name
-    return tmp_path
+    # 1行目から順に代入（例：B2, G2 → B3, G3 → ...）
+    start_row = 2  # 1行目はヘッダー想定
+    for idx, fields in enumerate(list_of_fields):
+        for key, cell in cfg.get("excel_cell_map", {}).items():
+            # 列記号と行番号を分離
+            import re
+            m = re.match(r"([A-Z]+)(\d+)", cell)
+            if m:
+                col, base_row = m.group(1), int(m.group(2))
+                target_cell = f"{col}{start_row + idx}"
+                if key in fields:
+                    ws[target_cell] = fields[key]
+    out_path = "output_combined.xlsx"
+    wb.save(out_path)
+    return out_path
