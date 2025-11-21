@@ -88,20 +88,6 @@ with mid:
             # まとめてExcelに代入
             excel_path = write_to_excel(all_fields, cfg)
             st.session_state.output_files = excel_path
-    else:
-        run_excel_btn = st.button(
-            "Excel明細をテンプレートに反映",
-            type="primary",
-            use_container_width=True,
-            disabled=st.session_state.excel_file is None
-        )
-        if run_excel_btn and st.session_state.excel_file is not None:
-            with st.spinner("Excel処理中..."):
-                fields, preview_df = process_excel_bytes(st.session_state.excel_file.read(), cfg)
-                st.session_state.raw_df = preview_df
-                excel_path = write_to_excel(fields, cfg)
-                st.session_state.excel_out = excel_path
-                st.success("Excel明細の反映が完了しました！")
 
 with right:
     st.subheader("③ 結果プレビュー・ダウンロード")
