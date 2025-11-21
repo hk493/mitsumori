@@ -1,31 +1,25 @@
 {
-  "poppler_path": "C:\\Users\\1109933\\Downloads\\Release-24.08.0-0\\poppler-24.08.0\\Library\\bin",
+  "poppler_path": "C:\\poppler-24.07.0\\Library\\bin",
   "ocr": {
-    "dpi": 400,
+    "dpi": 200,
     "read_all_pages": true
   },
   "paddle": {
     "lang": "japan",
-    "use_angle_cls": true
+    "use_angle_cls": false
+  },
+  "performance": {
+    "max_workers": 2,
+    "max_pages_per_pdf": 3,
+    "max_width": 1000
   },
   "stop_keywords": [
     "病院", "医院", "大学", "センター", "組合", "会社", "株式会社", "有限会社",
     "工業", "電力", "商事", "製作所", "建設", "設備", "役場", "市役所", "庁"
   ],
   "targets": {
-    "法人名": {
-      "regex": [
-        "(?:宛|御中)?\\s*([\\u4E00-\\u9FFF\\u3040-\\u30FFA-Za-z一-龠々ヶ\\s　]+?)(?:\\s*(?:御中|様))",
-        "^(?:株式会社|有限会社|医療法人|学校法人|社会福祉法人|合同会社)[^\\n]+",
-        "([\\u4E00-\\u9FFF\\u3040-\\u30FFA-Za-z一-龠々ヶ]+?(?:病院|医院|会社|株式会社|大学|センター|組合))"
-      ]
-    },
-    "契約電力": {
-      "regex": [
-        "(主契約|契約電力|基本契約|契約\\s*力|契約kW|契約ｋＷ)[^\\n]{0,20}?([0-9]+(?:\\.[0-9]+)?)\\s*kW(?!h)",
-        "(?<!\\d)([1-9]\\d{0,4}(?:\\.[0-9]+)?)\\s*kW(?!h)"
-      ]
-    }
+    "法人名": {},
+    "契約電力": {}
   },
   "excel_cell_map": {
     "sheet": "高圧",
