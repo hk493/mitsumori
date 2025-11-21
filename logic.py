@@ -34,6 +34,7 @@ def process_pdf_bytes(pdf_bytes: bytes, cfg: dict) -> Tuple[Dict, str]:
 
     images = convert_from_bytes(pdf_bytes, dpi=dpi)
     texts = []
+    fields = {}
     for i, img in enumerate(images):
         if i >= max_pages:
             break
@@ -51,10 +52,15 @@ def process_pdf_bytes(pdf_bytes: bytes, cfg: dict) -> Tuple[Dict, str]:
         res = ocr.ocr(img_np, cls=use_angle_cls)
         page_text = "\n".join([t[1][0] for line in res for t in (line if isinstance(line, list) else [line])])
         texts.append(page_text)
-    return {}, "\n\n".join(texts)
+        # 簡易フィールド抽出例（法人名・契約電力）
+        for k in cfg.get("targets", {}):
+            for kw in cfg.get("excel_input", {}).get("label_keywords", {}).get(k, []):
+                match = re.search(rf"{kw}[:：]?\s*([^\s\n]+)", page_text)
+                if match:
+                    fields[k] = match.group(1)
+    return fields, "\n\n".join(texts)
 
 def process_excel_bytes(excel_bytes: bytes, cfg: dict) -> Tuple[Dict, pd.DataFrame]:
-    # ExcelファイルをDataFrameとしてプレビュー
     from io import BytesIO
     excel_io = BytesIO(excel_bytes)
     wb = load_workbook(excel_io, data_only=True)
@@ -63,20 +69,36 @@ def process_excel_bytes(excel_bytes: bytes, cfg: dict) -> Tuple[Dict, pd.DataFra
     data = ws.values
     cols = next(data)
     df = pd.DataFrame(data, columns=cols)
-    # fields抽出は必要に応じて追加
-    return {}, df
+    fields = {}
+    # 簡易フィールド抽出例（法人名・契約電力）
+    for k in cfg.get("targets", {}):
+        for kw in cfg.get("excel_input", {}).get("label_keywords", {}).get(k, []):
+            for col in df.columns:
+                if kw in str(col):
+                    fields[k] = df[col].iloc[0]
+    return fields, df
 
-def write_to_excel(fields: Dict, cfg: dict) -> str:
-    # テンプレートExcelにfieldsを書き込む（必要に応じて実装）
+def write_to_excel(list_of_fields: list, cfg: dict) -> str:
+    from openpyxl import load_workbook
     template_path = Path("template_output.xlsx")
     if not template_path.exists():
-        return "テンプレートExcelがありません"
+        return ""
     wb = load_workbook(template_path)
     sheet_name = cfg.get("excel_cell_map", {}).get("sheet", wb.sheetnames[0])
     ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.active
-    for key, cell in cfg.get("excel_cell_map", {}).items():
-        if key in fields:
-            ws[cell] = fields[key]
-    out_path = "output.xlsx"
+
+    # 1行目から順に代入（例：B2, G2 → B3, G3 → ...）
+    start_row = 2  # 1行目はヘッダー想定
+    for idx, fields in enumerate(list_of_fields):
+        for key, cell in cfg.get("excel_cell_map", {}).items():
+            # 列記号と行番号を分離
+            import re
+            m = re.match(r"([A-Z]+)(\d+)", cell)
+            if m:
+                col, base_row = m.group(1), int(m.group(2))
+                target_cell = f"{col}{start_row + idx}"
+                if key in fields:
+                    ws[target_cell] = fields[key]
+    out_path = "output_combined.xlsx"
     wb.save(out_path)
     return out_path
